@@ -20,6 +20,10 @@ on:
         description: "utmapp/UTM ref that provides scripts/package.sh (utm-* modes only)"
         type: string
         default: main
+      remove_extensions:
+        description: "Optional: comma-separated bundle names to delete from the app before zipping, e.g. iOSHelper.appex"
+        type: string
+        default: ""
       publish_release:
         description: "Also publish the IPA as a release in this repo (stable download link)"
         type: boolean
@@ -124,6 +128,48 @@ jobs:
             (cd "$OUT" && zip -qry "$NAME.ipa" Payload && rm -rf Payload)
           fi
           ls -lh "$OUT"
+
+      - name: Remove extensions
+        if: inputs.remove_extensions != ''
+        env:
+          REMOVE: ${{ inputs.remove_extensions }}
+        run: |
+          set -euo pipefail
+          OUT="$PWD/out"
+          cd "$OUT"
+          shopt -s nullglob
+          for ipa in *.ipa; do
+            T="$(mktemp -d)"
+            unzip -q "$ipa" -d "$T"
+            IFS=',' read -ra NAMES <<< "$REMOVE"
+            for n in "${NAMES[@]}"; do
+              n="$(echo "$n" | xargs)"
+              [ -n "$n" ] || continue
+              echo "Removing $n from $ipa:"
+              find "$T" -type d -name "$n" -print -prune -exec rm -rf {} +
+            done
+            rm -f "$ipa"
+            (cd "$T" && zip -qry "$OUT/$ipa" Payload)
+            rm -rf "$T"
+          done
+
+      # Prints where every extension lives and its bundle ID, so mismatches are easy to spot in the log
+      - name: Inspect IPA
+        run: |
+          set -euo pipefail
+          cd out
+          shopt -s nullglob
+          for ipa in *.ipa; do
+            T="$(mktemp -d)"
+            unzip -q "$ipa" -d "$T"
+            APP="$(ls -d "$T"/Payload/*.app | head -n 1)"
+            echo "== $ipa"
+            echo "Main app ID: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+            find "$APP" -type d -name '*.appex' | while IFS= read -r x; do
+              echo "  ${x#"$APP"/}  ->  $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$x/Info.plist")"
+            done
+            rm -rf "$T"
+          done
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
