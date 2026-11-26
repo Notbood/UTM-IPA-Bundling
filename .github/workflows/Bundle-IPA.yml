@@ -1,0 +1,144 @@
+name: Build IPA from link
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Download link: direct file URL, or a GitHub Actions artifact link (.../actions/runs/N/artifacts/N)"
+        required: true
+        type: string
+      mode:
+        description: "How to turn it into an IPA"
+        type: choice
+        default: utm-ipa
+        options:
+          - utm-ipa
+          - utm-ipa-se
+          - utm-ipa-hv
+          - plain-zip
+      utm_ref:
+        description: "utmapp/UTM ref that provides scripts/package.sh (utm-* modes only)"
+        type: string
+        default: main
+      publish_release:
+        description: "Also publish the IPA as a release in this repo (stable download link)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      # UTM's own packaging script (does the ldid fake-signing the official IPA gets)
+      - name: Get UTM packaging script
+        if: startsWith(inputs.mode, 'utm-')
+        uses: actions/checkout@v4
+        with:
+          repository: utmapp/UTM
+          ref: ${{ inputs.utm_ref }}
+          path: utm-src
+
+      - name: Install ldid
+        if: startsWith(inputs.mode, 'utm-')
+        run: brew install ldid
+
+      - name: Download
+        env:
+          URL: ${{ inputs.url }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          re='github\.com/([^/]+)/([^/]+)/actions/runs/[0-9]+/artifacts/([0-9]+)'
+          if [[ "$URL" =~ $re ]]; then
+            OWNER="${BASH_REMATCH[1]}"; REPO="${BASH_REMATCH[2]}"; ID="${BASH_REMATCH[3]}"
+            echo "GitHub Actions artifact: $OWNER/$REPO #$ID"
+            # Artifact links need authentication, so go through the API with a token
+            curl -fL --retry 3 \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -o work/download \
+              "https://api.github.com/repos/$OWNER/$REPO/actions/artifacts/$ID/zip"
+          else
+            curl -fL --retry 3 -o work/download "$URL"
+          fi
+          ls -lh work
+
+      - name: Extract
+        run: |
+          set -euo pipefail
+          cd work
+          mkdir extract
+          if unzip -q download -d extract 2>/dev/null; then
+            echo "Extracted as zip"
+          elif tar -xf download -C extract 2>/dev/null; then
+            echo "Extracted as tar"
+          else
+            echo "Not an archive, keeping as raw file"
+            cp download extract/
+          fi
+          # Unpack nested tarballs (e.g. UTM.xcarchive.tgz inside the artifact zip)
+          find extract -type f \( -name '*.tgz' -o -name '*.tar.gz' -o -name '*.tar' \) | while IFS= read -r f; do
+            tar -xf "$f" -C "$(dirname "$f")"
+          done
+
+      - name: Detect contents
+        run: |
+          set -euo pipefail
+          cd work
+          XCARCHIVE="$(find extract -type d -name '*.xcarchive' -print -quit)"
+          APP="$(find extract -type d -name '*.app' -not -path '*/Frameworks/*' -not -path '*/PlugIns/*' -print -quit)"
+          if [ -n "$XCARCHIVE" ]; then echo "XCARCHIVE=$PWD/$XCARCHIVE" >> "$GITHUB_ENV"; fi
+          if [ -n "$APP" ]; then echo "APP=$PWD/$APP" >> "$GITHUB_ENV"; fi
+          if [ -z "$XCARCHIVE$APP" ]; then
+            echo "::error::Found no .xcarchive or .app in the download"
+            find extract -maxdepth 3
+            exit 1
+          fi
+          echo "xcarchive: ${XCARCHIVE:-none}"
+          echo "app: ${APP:-none}"
+
+      - name: Package IPA
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          OUT="$PWD/out"
+          if [[ "$MODE" == utm-* ]]; then
+            [ -n "${XCARCHIVE:-}" ] || { echo "::error::utm-* modes need an .xcarchive"; exit 1; }
+            # utm-ipa -> "ipa", utm-ipa-se -> "ipa-se", utm-ipa-hv -> "ipa-hv"
+            bash ./utm-src/scripts/package.sh "${MODE#utm-}" "$XCARCHIVE" "$OUT"
+          else
+            if [ -n "${XCARCHIVE:-}" ]; then
+              APP_PATH="$(find "$XCARCHIVE/Products/Applications" -maxdepth 1 -name '*.app' -print -quit)"
+            else
+              APP_PATH="$APP"
+            fi
+            NAME="$(basename "$APP_PATH" .app)"
+            mkdir -p "$OUT/Payload"
+            cp -R "$APP_PATH" "$OUT/Payload/"
+            (cd "$OUT" && zip -qry "$NAME.ipa" Payload && rm -rf Payload)
+          fi
+          ls -lh "$OUT"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa
+          path: out/*.ipa
+          compression-level: 0
+
+      - name: Publish release
+        if: inputs.publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          URL: ${{ inputs.url }}
+        run: |
+          gh release create "ipa-${{ github.run_number }}" out/*.ipa \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "IPA #${{ github.run_number }}" \
+            --notes "Built from: $URL (mode: ${{ inputs.mode }})"
